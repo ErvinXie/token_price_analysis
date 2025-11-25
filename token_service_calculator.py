@@ -27,18 +27,17 @@ class ModelPricing:
 
 @dataclass
 class ServiceProfile:
-    """单个服务的配置"""
+    """单个服务的配置（服务质量）"""
     input_tokens: int      # 平均输入token数
     output_tokens: int     # 平均输出token数
-    response_time: float   # 平均响应时间（秒）
+    prefill_tps: float     # 服务prefill性能 (tokens/sec)
+    decode_tps: float      # 服务decode性能 (tokens/sec)
 
 
 @dataclass
 class HardwarePerformance:
-    """硬件性能配置"""
+    """硬件性能配置 - 只关心并发能力"""
     hardware_name: str              # 硬件名称（关联数据库）
-    prefill_tps: float              # prefill tokens per second
-    decode_tps: float               # decode tokens per second
     max_concurrent_requests: int    # 最大并发请求数
     cost_mode: str = "rental"       # 成本模式: "rental" 或 "purchase"
     gpu_count: int = 1              # GPU数量
@@ -131,9 +130,9 @@ class TokenServiceCalculator:
             self.service_profile.output_tokens
         )
 
-        # 单次请求处理时间（基于硬件性能）
-        prefill_time = self.service_profile.input_tokens / self.hardware.prefill_tps
-        decode_time = self.service_profile.output_tokens / self.hardware.decode_tps
+        # 单次请求处理时间（基于服务质量参数）
+        prefill_time = self.service_profile.input_tokens / self.service_profile.prefill_tps
+        decode_time = self.service_profile.output_tokens / self.service_profile.decode_tps
         processing_time = prefill_time + decode_time
 
         # 理论QPS（每秒处理的请求数）
@@ -147,6 +146,8 @@ class TokenServiceCalculator:
 
         return {
             'revenue_per_request': revenue_per_request,
+            'prefill_time': prefill_time,
+            'decode_time': decode_time,
             'processing_time': processing_time,
             'qps_per_instance': qps_per_instance,
             'daily_requests_per_instance': daily_requests_per_instance,
@@ -155,19 +156,11 @@ class TokenServiceCalculator:
 
     def calculate_hardware_capacity(self) -> Dict:
         """计算硬件的总服务能力"""
-        # 实际并发数受硬件限制
-        effective_concurrent_requests = min(
-            self.hardware.max_concurrent_requests,
-            self.hardware.prefill_tps / self.service_profile.input_tokens * 10  # 估算值
-        )
-
-        # 计算总QPS
-        single_qps = 1 / self.service_profile.response_time if self.service_profile.response_time > 0 else 0
-        total_qps = effective_concurrent_requests * single_qps
+        # 获取基于SLA的有效并发数
+        effective_concurrent_requests = self.get_effective_concurrency()
 
         return {
             'max_concurrent_requests': effective_concurrent_requests,
-            'total_qps': total_qps,
             'instances_count': effective_concurrent_requests
         }
 
@@ -214,22 +207,24 @@ class TokenServiceCalculator:
         }
 
     def get_effective_concurrency(self) -> int:
-        """获取基于SLA的有效并发数"""
-        if not all([self.model_pricing, self.hardware, self.service_params]):
+        """获取基于SLA和服务质量的有效并发数"""
+        if not all([self.model_pricing, self.hardware, self.service_params, self.service_profile]):
             return self.hardware.max_concurrent_requests if self.hardware else 0
 
-        # 尝试从数据库获取精确的并发容量
+        # 尝试从数据库获取精确的并发容量（基于input/output tokens）
         try:
             capacity = self.db.calculate_hardware_capacity(
                 self.hardware.hardware_name,
                 self._get_model_key_from_pricing(),
-                self.service_params.sla_level
+                self.service_params.sla_level,
+                self.service_profile.input_tokens,
+                self.service_profile.output_tokens
             )
 
             if capacity:
                 return capacity['max_concurrent_requests']
-        except Exception:
-            pass  # 如果数据库查询失败，使用简化计算
+        except Exception as e:
+            print(f"⚠️  从数据库获取并发容量失败，使用简化计算: {e}")
 
         # 简化计算：基于SLA等级调整并发数
         sla_configs = {
@@ -253,14 +248,16 @@ class TokenServiceCalculator:
 
     def calculate_lifecycle_revenue(self) -> Dict:
         """计算生命周期总收益"""
-        # 单服务指标
+        # 单服务指标（包含基于硬件的处理时间）
         single_metrics = self.calculate_single_service_metrics()
 
-        # 使用新的并发容量计算
+        # 获取基于SLA的有效并发数
         effective_concurrent_requests = self.get_effective_concurrency()
-        total_qps = effective_concurrent_requests / self.service_profile.response_time
 
-        # 总QPS（考虑负载系数）
+        # 总QPS = 并发数 × 单个实例的QPS
+        total_qps = effective_concurrent_requests * single_metrics['qps_per_instance']
+
+        # 有效QPS（考虑负载系数）
         effective_qps = total_qps * self.service_params.average_load_factor
 
         # 每日总请求数
@@ -287,6 +284,10 @@ class TokenServiceCalculator:
 
         return {
             'single_request_revenue': single_metrics['revenue_per_request'],
+            'prefill_time': single_metrics['prefill_time'],
+            'decode_time': single_metrics['decode_time'],
+            'processing_time': single_metrics['processing_time'],
+            'qps_per_instance': single_metrics['qps_per_instance'],
             'effective_qps': effective_qps,
             'daily_total_requests': daily_total_requests,
             'daily_revenue': daily_total_revenue,
@@ -311,27 +312,32 @@ class TokenServiceCalculator:
 LLM Token服务收益分析报告
 {'=' * 50}
 
-模型配置:
-- 模型名称: {self.model_pricing.model_name}
+服务质量配置:
 - 输入Token数: {self.service_profile.input_tokens:,}
 - 输出Token数: {self.service_profile.output_tokens:,}
 - 输入输出比例: {self.service_profile.input_tokens/self.service_profile.output_tokens:.2f}
-- 平均响应时间: {self.service_profile.response_time:.3f}秒
+- Pre-fill TPS: {self.service_profile.prefill_tps:,.0f} tokens/sec
+- Decode TPS: {self.service_profile.decode_tps:,.0f} tokens/sec
+
+模型配置:
+- 模型名称: {self.model_pricing.model_name}
+- 输入Token: ¥{self.model_pricing.input_price_per_m:.2f}/M tokens
+- 输出Token: ¥{self.model_pricing.output_price_per_m:.2f}/M tokens
+- 单请求收益: ¥{metrics['single_request_revenue']:.6f}
 
 硬件配置:
 - 硬件类型: {self.hardware.hardware_name}
 - GPU数量: {self.hardware.gpu_count}
 - 成本模式: {self.hardware.cost_mode}
-- Pre-fill TPS: {self.hardware.prefill_tps:,.0f}
-- Decode TPS: {self.hardware.decode_tps:,.0f}
-- 最大并发数: {self.hardware.max_concurrent_requests}
+- 声明最大并发数: {self.hardware.max_concurrent_requests}
 
-定价策略:
-- 输入Token: ¥{self.model_pricing.input_price_per_m:.2f}/M tokens
-- 输出Token: ¥{self.model_pricing.output_price_per_m:.2f}/M tokens
-- 单请求收益: ¥{metrics['single_request_revenue']:.6f}
+处理性能:
+- Pre-fill时间: {metrics['prefill_time']:.4f} 秒
+- Decode时间: {metrics['decode_time']:.4f} 秒
+- 单次请求处理时间: {metrics['processing_time']:.4f} 秒
+- 单实例QPS: {metrics['qps_per_instance']:.3f}
 
-服务参数:
+服务运行参数:
 - 生命周期: {self.service_params.lifecycle_years} 年
 - 平均负载系数: {self.service_params.average_load_factor:.1%}
 - 服务可用性: {self.service_params.uptime_percentage:.1%}
@@ -342,8 +348,8 @@ LLM Token服务收益分析报告
 - 硬件总成本: ¥{metrics['hardware_cost']['lifecycle_cost']:,.2f}
 
 收益分析:
-- 有效QPS: {metrics['effective_qps']:.1f}
-- 并发容量: {metrics['concurrent_capacity']} 个请求
+- 有效并发容量: {metrics['concurrent_capacity']} 个请求
+- 总QPS: {metrics['effective_qps']:.1f}
 - 日处理请求量: {metrics['daily_total_requests']:,.0f}
 - 日收益: ¥{metrics['daily_revenue']:,.2f}
 - 日净收益: ¥{metrics['daily_net_revenue']:,.2f}
@@ -354,7 +360,7 @@ LLM Token服务收益分析报告
 
 利用率分析:
 - 硬件利用率: {metrics['utilization_rate']:.1%}
-- 峰值QPS: {metrics['effective_qps'] / self.service_params.average_load_factor:.1f}
+- 理论峰值QPS: {metrics['effective_qps'] / metrics['utilization_rate']:.1f}
 - 利润率: {(metrics['lifecycle_net_revenue'] / metrics['lifecycle_revenue'] * 100):.1f}%
 """
 
@@ -366,22 +372,21 @@ def create_example_calculator(model_key: str = "qwen2-7b") -> TokenServiceCalcul
     # 设置模型定价
     calc.set_model_from_catalog(model_key)
 
-    # 服务配置
+    # 服务配置（服务质量）
     service_profile = ServiceProfile(
-        input_tokens=1000,    # 1k输入tokens
-        output_tokens=500,    # 500输出tokens
-        response_time=3.5     # 3.5秒响应时间
+        input_tokens=8000,     # 8k输入tokens
+        output_tokens=2000,    # 2k输出tokens
+        prefill_tps=4000,     # 4k prefills/sec (RTX4090x4的理论值)
+        decode_tps=20         # 20 decodes/sec
     )
     calc.set_service_profile(service_profile)
 
-    # 硬件性能（使用数据库中的硬件配置）
+    # 硬件性能（只关心并发能力，TPS属于服务质量）
     hardware = HardwarePerformance(
-        hardware_name="RTX4090x4",  # 使用数据库中的硬件配置
-        prefill_tps=16000,     # 16k prefills/sec (RTX4090x4的理论值)
-        decode_tps=400,        # 400 decodes/sec
-        max_concurrent_requests=200,  # 最大200并发
+        hardware_name="8xH20",  # 使用数据库中的硬件配置
+        max_concurrent_requests=32,  # 最大32并发
         cost_mode="rental",    # 租用模式
-        gpu_count=4,          # 4个GPU
+        gpu_count=8,          # 8个GPU
         power_consumption_w=1500  # 1500W功耗
     )
     calc.set_hardware(hardware)
@@ -419,7 +424,7 @@ if __name__ == "__main__":
     else:
         # 运行示例分析
         try:
-            calculator = create_example_calculator("qwen-qwen2-5-14b-instruct")
+            calculator = create_example_calculator("moonshotai-kimi-k2-thinking")
             print(calculator.generate_report())
 
             print("\n" + "=" * 60)
