@@ -33,16 +33,6 @@ class HardwareConfig:
 
 
 @dataclass
-class ModelHardwarePerformance:
-    """模型在特定硬件上的基准性能数据"""
-    model_key: str
-    hardware_name: str
-    max_concurrent: int
-    memory_usage_gb: float
-    avg_response_time_ms: float
-
-
-@dataclass
 class ModelPricing:
     """模型定价数据结构"""
     model_key: str              # 模型唯一标识
@@ -55,16 +45,6 @@ class ModelPricing:
     parameter_size: str = ""    # 参数量
     model_type: str = ""        # 模型类型
     last_updated: str = ""      # 最后更新时间
-
-
-@dataclass
-class SLALevel:
-    """服务水平等级定义"""
-    level: str
-    name: str
-    description: str
-    availability_target: float
-    max_concurrent_ratio: float  # 相对于硬件最大并发的比例
 
 
 class TokenServiceDatabase:
@@ -137,53 +117,35 @@ class TokenServiceDatabase:
                 )
             """)
 
-            # 模型硬件基准性能表（存储实测基准数据）
+            # 服务配置表（ServiceProfile）
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS model_hardware_performance (
+                CREATE TABLE IF NOT EXISTS service_profiles (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    model_key TEXT NOT NULL,
-                    hardware_name TEXT NOT NULL,
-                    max_concurrent INTEGER NOT NULL,
-                    memory_usage_gb REAL NOT NULL,
-                    avg_response_time_ms REAL NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(model_key, hardware_name),
-                    FOREIGN KEY (hardware_name) REFERENCES hardware_configs(name)
-                )
-            """)
-
-            # SLA等级表
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS sla_levels (
-                    level TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
                     description TEXT,
-                    availability_target REAL NOT NULL,
-                    max_concurrent_ratio REAL NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    input_tokens INTEGER NOT NULL,
+                    output_tokens INTEGER NOT NULL,
+                    prefill_tps INTEGER NOT NULL,
+                    decode_tps INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(name)
                 )
             """)
 
-            # 硬件-模型-SLA并发容量表（按服务质量配置）
+            # 服务配置-硬件容量关联表（MN关系）
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS hardware_model_sla_capacity (
+                CREATE TABLE IF NOT EXISTS service_profile_hardware_capacity (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    service_profile_id INTEGER NOT NULL,
                     hardware_name TEXT NOT NULL,
-                    model_key TEXT NOT NULL,
-                    sla_level TEXT NOT NULL,
-                    input_tokens INTEGER NOT NULL,
-                    output_tokens INTEGER NOT NULL,
                     max_concurrent_requests INTEGER NOT NULL,
-                    effective_qps REAL NOT NULL,
-                    memory_usage_percent REAL DEFAULT 0.0,
-                    cpu_usage_percent REAL DEFAULT 0.0,
                     notes TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(hardware_name, model_key, sla_level, input_tokens, output_tokens),
-                    FOREIGN KEY (hardware_name) REFERENCES hardware_configs(name),
-                    FOREIGN KEY (sla_level) REFERENCES sla_levels(level)
+                    UNIQUE(service_profile_id, hardware_name),
+                    FOREIGN KEY (service_profile_id) REFERENCES service_profiles(id),
+                    FOREIGN KEY (hardware_name) REFERENCES hardware_configs(name)
                 )
             """)
 
@@ -210,136 +172,6 @@ class TokenServiceDatabase:
             ))
             conn.commit()
 
-    def add_model_hardware_performance(self, performance: ModelHardwarePerformance):
-        """添加模型硬件基准性能数据"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO model_hardware_performance
-                (model_key, hardware_name, max_concurrent, memory_usage_gb,
-                 avg_response_time_ms, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                performance.model_key, performance.hardware_name,
-                performance.max_concurrent, performance.memory_usage_gb,
-                performance.avg_response_time_ms, datetime.now()
-            ))
-            conn.commit()
-
-    def add_sla_level(self, sla: SLALevel):
-        """添加SLA等级"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO sla_levels
-                (level, name, description, availability_target, max_concurrent_ratio)
-                VALUES (?, ?, ?, ?, ?)
-            """, (sla.level, sla.name, sla.description,
-                  sla.availability_target, sla.max_concurrent_ratio))
-            conn.commit()
-
-    def calculate_hardware_capacity(self, hardware_name: str, model_key: str, sla_level: str,
-                                    input_tokens: int, output_tokens: int) -> Optional[Dict]:
-        """计算特定硬件-模型-SLA-服务质量组合的并发容量"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-
-            # 检查是否已有缓存数据（基于input_tokens和output_tokens）
-            cursor.execute("""
-                SELECT max_concurrent_requests, effective_qps,
-                       memory_usage_percent, cpu_usage_percent
-                FROM hardware_model_sla_capacity
-                WHERE hardware_name = ? AND model_key = ? AND sla_level = ?
-                  AND input_tokens = ? AND output_tokens = ?
-            """, (hardware_name, model_key, sla_level, input_tokens, output_tokens))
-
-            cached = cursor.fetchone()
-            if cached:
-                return {
-                    'max_concurrent_requests': cached[0],
-                    'effective_qps': cached[1],
-                    'memory_usage_percent': cached[2],
-                    'cpu_usage_percent': cached[3]
-                }
-
-            # 计算容量并缓存
-            capacity = self._calculate_new_capacity(
-                hardware_name, model_key, sla_level, input_tokens, output_tokens
-            )
-            if capacity:
-                self._cache_capacity(
-                    hardware_name, model_key, sla_level,
-                    input_tokens, output_tokens, capacity
-                )
-
-            return capacity
-
-    def _calculate_new_capacity(self, hardware_name: str, model_key: str, sla_level: str,
-                                input_tokens: int, output_tokens: int) -> Optional[Dict]:
-        """计算新的并发容量（模拟简化版本）"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-
-            # 获取模型硬件基准配置
-            cursor.execute("""
-                SELECT max_concurrent, avg_response_time_ms
-                FROM model_hardware_performance
-                WHERE hardware_name = ? AND model_key = ?
-            """, (hardware_name, model_key))
-
-            perf = cursor.fetchone()
-            if not perf:
-                return None
-
-            # 获取SLA要求
-            cursor.execute("""
-                SELECT max_concurrent_ratio, availability_target
-                FROM sla_levels
-                WHERE level = ?
-            """, (sla_level,))
-
-            sla = cursor.fetchone()
-            if not sla:
-                return None
-
-            max_concurrent, baseline_response_time = perf
-            concurrent_ratio, availability = sla
-
-            # 基于token数调整并发（简化逻辑）
-            # token越多，处理时间越长，需要降低并发
-            token_ratio = (input_tokens + output_tokens) / 10000  # 假设10k tokens是基准
-            adjusted_concurrent = int(max_concurrent / max(1.0, token_ratio * 0.5))
-
-            # SLA限制下的并发数（基于可用性目标调整）
-            effective_concurrent = int(adjusted_concurrent * concurrent_ratio * availability)
-
-            # 计算QPS（基于实际场景模拟）
-            effective_qps = effective_concurrent / (baseline_response_time / 1000) * availability
-
-            return {
-                'max_concurrent_requests': effective_concurrent,
-                'effective_qps': effective_qps,
-                'memory_usage_percent': (effective_concurrent / max_concurrent) * 100,
-                'cpu_usage_percent': min(95, (effective_concurrent / max_concurrent) * availability * 100)
-            }
-
-    def _cache_capacity(self, hardware_name: str, model_key: str, sla_level: str,
-                        input_tokens: int, output_tokens: int, capacity: Dict):
-        """缓存计算结果（包含input/output tokens）"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO hardware_model_sla_capacity
-                (hardware_name, model_key, sla_level, input_tokens, output_tokens,
-                 max_concurrent_requests, effective_qps,
-                 memory_usage_percent, cpu_usage_percent, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (hardware_name, model_key, sla_level, input_tokens, output_tokens,
-                  capacity['max_concurrent_requests'], capacity['effective_qps'],
-                  capacity['memory_usage_percent'], capacity['cpu_usage_percent'],
-                  datetime.now()))
-            conn.commit()
-
     def get_hardware_configs(self) -> List[HardwareConfig]:
         """获取所有硬件配置"""
         with sqlite3.connect(self.db_path) as conn:
@@ -354,16 +186,70 @@ class TokenServiceDatabase:
 
             return [HardwareConfig(*row) for row in cursor.fetchall()]
 
-    def get_sla_levels(self) -> List[SLALevel]:
-        """获取所有SLA等级"""
+    def add_service_profile(self, name: str, description: str, input_tokens: int,
+                           output_tokens: int, prefill_tps: int, decode_tps: int) -> int:
+        """添加服务配置，返回ID"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT level, name, description, availability_target, max_concurrent_ratio
-                FROM sla_levels
-            """)
+                INSERT OR REPLACE INTO service_profiles
+                (name, description, input_tokens, output_tokens, prefill_tps, decode_tps, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, description, input_tokens, output_tokens, prefill_tps, decode_tps, datetime.now()))
 
-            return [SLALevel(*row) for row in cursor.fetchall()]
+            # 获取插入的ID
+            cursor.execute("SELECT last_insert_rowid()")
+            profile_id = cursor.fetchone()[0]
+            conn.commit()
+            return profile_id
+
+    def get_service_profile(self, profile_id: int):
+        """获取服务配置 by ID"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, name, description, input_tokens, output_tokens, prefill_tps, decode_tps
+                FROM service_profiles
+                WHERE id = ?
+            """, (profile_id,))
+
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "id": row[0],
+                    "name": row[1],
+                    "description": row[2],
+                    "input_tokens": row[3],
+                    "output_tokens": row[4],
+                    "prefill_tps": row[5],
+                    "decode_tps": row[6]
+                }
+            return None
+
+    def add_service_profile_hardware_capacity(self, service_profile_id: int, hardware_name: str,
+                                             max_concurrent_requests: int, notes: str = ""):
+        """添加服务配置-硬件容量关联"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO service_profile_hardware_capacity
+                (service_profile_id, hardware_name, max_concurrent_requests, notes, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (service_profile_id, hardware_name, max_concurrent_requests, notes, datetime.now()))
+            conn.commit()
+
+    def get_service_profile_hardware_capacity(self, service_profile_id: int, hardware_name: str) -> Optional[int]:
+        """获取某个服务配置在某个硬件上的最大并发数"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT max_concurrent_requests
+                FROM service_profile_hardware_capacity
+                WHERE service_profile_id = ? AND hardware_name = ?
+            """, (service_profile_id, hardware_name))
+
+            result = cursor.fetchone()
+            return result[0] if result else None
 
     def add_model_pricing(self, pricing: ModelPricing):
         """添加模型定价"""
@@ -536,17 +422,6 @@ class TokenServiceDatabase:
 
     def init_default_data(self):
         """初始化默认数据"""
-        # 默认SLA等级（基于可用性和并发比例）
-        default_sla_levels = [
-            SLALevel("basic", "基础服务", "标准可用性，99%", 0.99, 1.0),
-            SLALevel("standard", "标准服务", "高可用性，99.5%", 0.995, 0.8),
-            SLALevel("premium", "高级服务", "极高可用性，99.9%", 0.999, 0.6),
-            SLALevel("enterprise", "企业服务", "超高可用性，99.99%", 0.9999, 0.4)
-        ]
-
-        for sla in default_sla_levels:
-            self.add_sla_level(sla)
-
         # 默认硬件配置
         default_hardware = [
             HardwareConfig(
@@ -588,36 +463,84 @@ class TokenServiceDatabase:
         for hardware in default_hardware:
             self.add_hardware_config(hardware)
 
-        # 默认模型硬件基准性能数据（实测值）
-        default_model_performance = [
-            # moonshotai/Kimi-K2-Thinking 在 RTX4090x4 上的基准性能（实测）
-            ModelHardwarePerformance(
-                model_key="moonshotai-kimi-k2-thinking",
-                hardware_name="RTX4090x4",
-                max_concurrent=200,  # 实测最大并发数
-                memory_usage_gb=80,  # 内存使用
-                avg_response_time_ms=5500  # 基准响应时间（实测）
-            ),
-            # moonshotai/Kimi-K2-Thinking 在 A100x8 上的基准性能
-            ModelHardwarePerformance(
-                model_key="moonshotai-kimi-k2-thinking",
-                hardware_name="A100x8",
-                max_concurrent=400,  # 更强的并发能力
-                memory_usage_gb=160,
-                avg_response_time_ms=2750  # 更快的响应时间
-            ),
-            # qwen2-7b 在 RTX4090x4 上的基准性能
-            ModelHardwarePerformance(
-                model_key="qwen2-7b",
-                hardware_name="RTX4090x4",
-                max_concurrent=250,
-                memory_usage_gb=60,
-                avg_response_time_ms=4400
-            )
-        ]
+        # 默认服务配置（服务质量配置）
+        # 配置1: 聊天服务（8k输入, 2k输出）
+        chat_service_id = self.add_service_profile(
+            name="chat_service",
+            description="聊天对话服务：8k输入, 2k输出",
+            input_tokens=8000,
+            output_tokens=2000,
+            prefill_tps=16000,
+            decode_tps=400
+        )
 
-        for perf in default_model_performance:
-            self.add_model_hardware_performance(perf)
+        # 配置2: 文档摘要服务（32k输入, 4k输出）
+        summary_service_id = self.add_service_profile(
+            name="summary_service",
+            description="文档摘要服务：32k输入, 4k输出",
+            input_tokens=32000,
+            output_tokens=4000,
+            prefill_tps=16000,
+            decode_tps=400
+        )
+
+        # 配置3: 代码生成服务（4k输入, 8k输出）
+        code_service_id = self.add_service_profile(
+            name="code_service",
+            description="代码生成服务：4k输入, 8k输出",
+            input_tokens=4000,
+            output_tokens=8000,
+            prefill_tps=16000,
+            decode_tps=400
+        )
+
+        # 添加容量关联：RTX4090x4 支持的服务配置
+        # 聊天服务在RTX4090x4上的容量
+        self.add_service_profile_hardware_capacity(
+            service_profile_id=chat_service_id,
+            hardware_name="RTX4090x4",
+            max_concurrent_requests=200,
+            notes="8k/2k对话服务，实测200并发"
+        )
+
+        # 文档摘要在RTX4090x4上的容量（token多，并发更少）
+        self.add_service_profile_hardware_capacity(
+            service_profile_id=summary_service_id,
+            hardware_name="RTX4090x4",
+            max_concurrent_requests=80,
+            notes="32k/4k长文本处理，受限于显存"
+        )
+
+        # 代码生成在RTX4090x4上的容量
+        self.add_service_profile_hardware_capacity(
+            service_profile_id=code_service_id,
+            hardware_name="RTX4090x4",
+            max_concurrent_requests=150,
+            notes="4k/8k代码生成，解码压力大"
+        )
+
+        # 添加容量关联：A100x8 支持的服务配置
+        # A100x8性能更强，支持更多并发
+        self.add_service_profile_hardware_capacity(
+            service_profile_id=chat_service_id,
+            hardware_name="A100x8",
+            max_concurrent_requests=400,
+            notes="8k/2k对话服务，A100x8实测"
+        )
+
+        self.add_service_profile_hardware_capacity(
+            service_profile_id=summary_service_id,
+            hardware_name="A100x8",
+            max_concurrent_requests=200,
+            notes="32k/4k长文本处理，A100x8大显存优势"
+        )
+
+        self.add_service_profile_hardware_capacity(
+            service_profile_id=code_service_id,
+            hardware_name="A100x8",
+            max_concurrent_requests=300,
+            notes="4k/8k代码生成，A100解码性能更强"
+        )
 
 
 def init_database():
@@ -630,10 +553,6 @@ def init_database():
     print(f"\n📋 硬件配置 ({len(db.get_hardware_configs())} 个):")
     for hw in db.get_hardware_configs():
         print(f"  - {hw.name}: {hw.gpu_type}x{hw.gpu_count}, 购买:¥{hw.purchase_cost_yuan:,}, 租用:¥{hw.monthly_rental_cost_yuan:,}/月")
-
-    print(f"\n🎯 SLA等级 ({len(db.get_sla_levels())} 个):")
-    for sla in db.get_sla_levels():
-        print(f"  - {sla.level}: {sla.name}, 可用性:{sla.availability_target*100:.1f}%, 并发比例:{sla.max_concurrent_ratio:.0%}")
 
 
 if __name__ == "__main__":

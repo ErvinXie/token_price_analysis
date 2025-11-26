@@ -8,7 +8,26 @@ LLM Token服务收益计算器
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 import json
-from database import TokenServiceDatabase, HardwareConfig, SLALevel
+from database import TokenServiceDatabase, HardwareConfig
+
+# 硬编码的SLA配置 (可用性目标, 并发比例)
+SLA_CONFIGS = {
+    "basic": {"availability": 0.99, "concurrent_ratio": 1.0},
+    "standard": {"availability": 0.995, "concurrent_ratio": 0.8},
+    "premium": {"availability": 0.999, "concurrent_ratio": 0.6},
+    "enterprise": {"availability": 0.9999, "concurrent_ratio": 0.4}
+}
+
+# 硬编码的模型-硬件性能基准 (最大并发数, 基准响应时间ms)
+MODEL_HARDWARE_PERFORMANCE = {
+    "moonshotai-kimi-k2-thinking": {
+        "RTX4090x4": {"max_concurrent": 200, "baseline_response_time_ms": 5500},
+        "A100x8": {"max_concurrent": 400, "baseline_response_time_ms": 2750}
+    },
+    "qwen2-7b": {
+        "RTX4090x4": {"max_concurrent": 250, "baseline_response_time_ms": 4400}
+    }
+}
 
 
 @dataclass
@@ -65,6 +84,7 @@ class TokenServiceCalculator:
     def __init__(self):
         self.model_pricing = None
         self.service_profile = None
+        self.service_profile_id = None  # 服务配置ID（关联数据库）
         self.hardware = None
         self.service_params = None
         self.db = TokenServiceDatabase()  # 初始化数据库连接
@@ -208,34 +228,32 @@ class TokenServiceCalculator:
 
     def get_effective_concurrency(self) -> int:
         """获取基于SLA和服务质量的有效并发数"""
-        if not all([self.model_pricing, self.hardware, self.service_params, self.service_profile]):
+        if not all([self.service_profile_id, self.hardware, self.service_params]):
             return self.hardware.max_concurrent_requests if self.hardware else 0
 
-        # 尝试从数据库获取精确的并发容量（基于input/output tokens）
-        try:
-            capacity = self.db.calculate_hardware_capacity(
-                self.hardware.hardware_name,
-                self._get_model_key_from_pricing(),
-                self.service_params.sla_level,
-                self.service_profile.input_tokens,
-                self.service_profile.output_tokens
-            )
+        # 从数据库获取服务配置在此硬件上的容量
+        max_concurrent = self.db.get_service_profile_hardware_capacity(
+            self.service_profile_id,
+            self.hardware.hardware_name
+        )
 
-            if capacity:
-                return capacity['max_concurrent_requests']
-        except Exception as e:
-            print(f"⚠️  从数据库获取并发容量失败，使用简化计算: {e}")
+        # 如果数据库中没有，使用硬件的默认值
+        if max_concurrent is None:
+            max_concurrent = self.hardware.max_concurrent_requests
 
-        # 简化计算：基于SLA等级调整并发数
-        sla_configs = {
-            "basic": 1.0,
-            "standard": 0.8,
-            "premium": 0.6,
-            "enterprise": 0.4
-        }
+        # 获取SLA配置（硬编码在代码中）
+        sla_level = self.service_params.sla_level
+        if sla_level not in SLA_CONFIGS:
+            sla_level = "standard"  # 默认使用standard
 
-        sla_ratio = sla_configs.get(self.service_params.sla_level, 0.8)
-        return int(self.hardware.max_concurrent_requests * sla_ratio)
+        sla_config = SLA_CONFIGS[sla_level]
+        availability = sla_config["availability"]
+        concurrent_ratio = sla_config["concurrent_ratio"]
+
+        # 应用SLA限制（可用性目标和并发比例）
+        effective_concurrent = int(max_concurrent * concurrent_ratio * availability)
+
+        return effective_concurrent
 
     def _get_model_key_from_pricing(self) -> str:
         """从模型定价获取模型key"""
@@ -365,28 +383,62 @@ LLM Token服务收益分析报告
 """
 
 
-def create_example_calculator(model_key: str = "qwen2-7b") -> TokenServiceCalculator:
+def create_example_calculator(model_key: str = "qwen2-7b", service_profile_name: str = "chat_service") -> TokenServiceCalculator:
     """创建示例计算器"""
     calc = TokenServiceCalculator()
+    db = TokenServiceDatabase()
 
     # 设置模型定价
     calc.set_model_from_catalog(model_key)
 
-    # 服务配置（服务质量）
-    service_profile = ServiceProfile(
-        input_tokens=8000,     # 8k输入tokens
-        output_tokens=2000,    # 2k输出tokens
-        prefill_tps=4000,     # 4k prefills/sec (RTX4090x4的理论值)
-        decode_tps=20         # 20 decodes/sec
-    )
+    # 从数据库获取服务配置
+    # 注意：这里简化处理，假设服务配置名称存在
+    # 实际应用中应该通过ID查询
+    if service_profile_name == "chat_service":
+        # 聊天服务配置
+        calc.service_profile_id = 1  # 假设chat_service的ID是1
+        service_profile = ServiceProfile(
+            input_tokens=8000,     # 8k输入tokens
+            output_tokens=2000,    # 2k输出tokens
+            prefill_tps=16000,     # 16k prefills/sec
+            decode_tps=400         # 400 decodes/sec
+        )
+    elif service_profile_name == "summary_service":
+        # 文档摘要服务配置
+        calc.service_profile_id = 2  # 假设summary_service的ID是2
+        service_profile = ServiceProfile(
+            input_tokens=32000,    # 32k输入tokens
+            output_tokens=4000,    # 4k输出tokens
+            prefill_tps=16000,     # 16k prefills/sec
+            decode_tps=400         # 400 decodes/sec
+        )
+    elif service_profile_name == "code_service":
+        # 代码生成服务配置
+        calc.service_profile_id = 3  # 假设code_service的ID是3
+        service_profile = ServiceProfile(
+            input_tokens=4000,     # 4k输入tokens
+            output_tokens=8000,    # 8k输出tokens
+            prefill_tps=16000,     # 16k prefills/sec
+            decode_tps=400         # 400 decodes/sec
+        )
+    else:
+        # 默认使用聊天服务
+        calc.service_profile_id = 1
+        service_profile = ServiceProfile(
+            input_tokens=8000,
+            output_tokens=2000,
+            prefill_tps=16000,
+            decode_tps=400
+        )
+
     calc.set_service_profile(service_profile)
 
     # 硬件性能（只关心并发能力，TPS属于服务质量）
     hardware = HardwarePerformance(
-        hardware_name="8xH20",  # 使用数据库中的硬件配置
-        max_concurrent_requests=32,  # 最大32并发
+        hardware_name="RTX4090x4",  # 使用数据库中的硬件配置
+        max_concurrent_requests=200,  # 最大200并发
         cost_mode="rental",    # 租用模式
-        gpu_count=8,          # 8个GPU
+        gpu_count=4,          # 4个GPU
         power_consumption_w=1500  # 1500W功耗
     )
     calc.set_hardware(hardware)
